@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.zip
+*.mp4
+*.wav
+*.mp3
+.DS_Store
+.vercel
+.env*
