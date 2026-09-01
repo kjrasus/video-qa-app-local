@@ -340,6 +340,34 @@
       }
     }
 
+    // Rebuilds the trimmed queue from the files that are actually on disk in
+    // the output folder, so processed results survive a reload. Blobs cannot
+    // be persisted, but the file handles can be re-read lazily.
+    async function loadTrimmedFromOutputDirectory() {
+      if (!outputDirHandle) return;
+
+      const items = [];
+      for await (const entry of outputDirHandle.values()) {
+        if (entry.kind !== 'file') continue;
+        if (!MEDIA_EXTENSIONS.test(entry.name)) continue;
+        const saved = session.trimmed.find(t => t.name === entry.name);
+        items.push({
+          file: null,
+          handle: entry,
+          name: entry.name,
+          sourceName: saved ? saved.sourceName : null,
+          status: saved && saved.status ? saved.status : 'approved',
+          savedTo: entry.name,
+          queue: 'trimmed'
+        });
+      }
+
+      items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+      trimmedFilesState = items;
+      items.forEach(recordTrimmedOutput);
+      updateUI();
+    }
+
     async function chooseOutputFolder() {
       if (!supportsFileSystemAccess()) {
         alert('This browser does not support local folder access. Use Chrome or Edge (desktop).');
@@ -349,10 +377,12 @@
         const handle = await window.showDirectoryPicker({ id: 'media-qa-output', mode: 'readwrite' });
         if (!(await ensurePermission(handle, 'readwrite'))) return;
         outputDirHandle = handle;
+        if (session.outputFolderName !== handle.name) session.trimmed = [];
         session.outputFolderName = handle.name;
         saveSession();
         await storeHandle('output', handle);
         renderFolderLabels();
+        await loadTrimmedFromOutputDirectory();
       } catch (err) {
         if (err && err.name === 'AbortError') return;
         console.error(err);
@@ -375,13 +405,14 @@
       saveSession();
       renderFolderLabels();
       if (inputDirHandle) await loadFilesFromInputDirectory();
+      if (outputDirHandle) await loadTrimmedFromOutputDirectory();
       if (!inputDirHandle && !outputDirHandle) {
         alert('Could not reconnect to the saved folders. Please choose them again.');
       }
     }
 
     // Writes a processed/trimmed file straight into the output folder.
-    // Returns the written file name, or null when no output folder is set.
+    // Returns { name, handle }, or null when no output folder is set.
     async function writeToOutputFolder(name, blob) {
       if (!outputDirHandle) return null;
       if (!(await ensurePermission(outputDirHandle, 'readwrite'))) return null;
@@ -391,7 +422,7 @@
       const writable = await fileHandle.createWritable();
       await writable.write(blob);
       await writable.close();
-      return fileName;
+      return { name: fileName, handle: fileHandle };
     }
 
     async function uniqueOutputName(name) {
@@ -1067,17 +1098,19 @@
       const anchorIndex = currentIndex;
       const anchorQueue = currentQueueType;
 
-      let savedTo = null;
+      let written = null;
       try {
-        savedTo = await writeToOutputFolder(outputName, blob);
+        written = await writeToOutputFolder(outputName, blob);
       } catch (err) {
         console.error(err);
         alert('Could not write to the output folder: ' + (err && err.message ? err.message : err));
       }
+      const savedTo = written ? written.name : null;
 
       const processedItem = {
-        file: blob,
-        handle: null,
+        // Once it is on disk the bytes are re-read from the handle on demand.
+        file: written ? null : blob,
+        handle: written ? written.handle : null,
         name: savedTo || outputName,
         sourceName: sourceItem ? sourceItem.name : null,
         status: 'approved',
