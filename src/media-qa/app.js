@@ -37,7 +37,6 @@
     let dragStart = { x: 0, y: 0 };
 
     // DOM Elements
-    const fileInput = document.getElementById('file-input');
     const fileListEl = document.getElementById('file-list');
     const trimmedFileListEl = document.getElementById('trimmed-file-list');
     const queueCountEl = document.getElementById('queue-count');
@@ -272,8 +271,16 @@
     async function ensurePermission(handle, mode) {
       if (!handle || !handle.queryPermission) return true;
       const opts = { mode };
-      if ((await handle.queryPermission(opts)) === 'granted') return true;
-      return (await handle.requestPermission(opts)) === 'granted';
+      try {
+        if ((await handle.queryPermission(opts)) === 'granted') return true;
+        return (await handle.requestPermission(opts)) === 'granted';
+      } catch (err) {
+        // Permission state can be stale after heavy batch processing, so don't
+        // let a query/request failure bubble up as a read error — treat it as
+        // "not currently confirmed" so callers can re-request on the parent.
+        console.warn('Could not confirm permission on a handle', err && err.name);
+        return false;
+      }
     }
 
     function renderFolderLabels() {
@@ -317,7 +324,7 @@
 
     async function chooseInputFolder() {
       if (!supportsFileSystemAccess()) {
-        alert('This browser does not support local folder access. Use Chrome or Edge (desktop), or the "Upload Files" button.');
+        alert('This browser does not support local folder access. Use Chrome or Edge (desktop).');
         return;
       }
       try {
@@ -341,13 +348,27 @@
     }
 
     // Rebuilds the trimmed queue from the files that are actually on disk in
-    // the output folder, so processed results survive a reload. Blobs cannot
-    // be persisted, but the file handles can be re-read lazily.
+    // the output folder's Approved/Trimmed subfolder, so processed results
+    // survive a reload. Blobs cannot be persisted, but the file handles can
+    // be re-read lazily.
     async function loadTrimmedFromOutputDirectory() {
       if (!outputDirHandle) return;
 
+      const approvedDir = await outputDirHandle
+        .getDirectoryHandle('Approved', { create: false })
+        .catch(() => null);
+      const trimmedDir = approvedDir
+        ? await approvedDir.getDirectoryHandle('Trimmed', { create: false }).catch(() => null)
+        : null;
+
+      if (!trimmedDir) {
+        trimmedFilesState = [];
+        updateUI();
+        return;
+      }
+
       const items = [];
-      for await (const entry of outputDirHandle.values()) {
+      for await (const entry of trimmedDir.values()) {
         if (entry.kind !== 'file') continue;
         if (!MEDIA_EXTENSIONS.test(entry.name)) continue;
         const saved = session.trimmed.find(t => t.name === entry.name);
@@ -358,6 +379,7 @@
           sourceName: saved ? saved.sourceName : null,
           status: saved && saved.status ? saved.status : 'approved',
           savedTo: entry.name,
+          savedCategory: 'trimmed',
           queue: 'trimmed'
         });
       }
@@ -411,21 +433,112 @@
       }
     }
 
-    // Writes a processed/trimmed file straight into the output folder.
-    // Returns { name, handle }, or null when no output folder is set.
-    async function writeToOutputFolder(name, blob) {
+    // Writes a processed file into the correct subfolder of the output root,
+    // routing by category: 'approved' -> Approved, 'trimmed' -> Approved/Trimmed,
+    // 'rejected' -> Rejected. When `exact` is true the file is written to
+    // exactly `name` (overwriting any existing copy) instead of uniquifying —
+    // this makes repeated decisions/idempotent clicks update one file rather
+    // than stacking duplicates. Returns { name, handle }, or null when no
+    // output folder is set (or creation/writing fails).
+    async function writeToOutputFolder(name, blob, category = 'approved', exact = false) {
       if (!outputDirHandle) return null;
       if (!(await ensurePermission(outputDirHandle, 'readwrite'))) return null;
 
-      const fileName = await uniqueOutputName(name);
-      const fileHandle = await outputDirHandle.getFileHandle(fileName, { create: true });
-      const writable = await fileHandle.createWritable();
-      await writable.write(blob);
-      await writable.close();
+      // During heavy batch processing the output directory's readwrite grant
+      // can lapse between the check above and the actual stream write. Retry
+      // a few times, re-requesting the handle's permission each attempt, so a
+      // mid-batch permission shift doesn't silently drop a decision to disk.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const result = await performOutputWrite(name, blob, category, exact);
+          return result;
+        } catch (err) {
+          console.warn(
+            'Output write failed for', name, `(${err && err.name})`,
+            'refreshing output permission and retrying.'
+          );
+          if (!(await ensurePermission(outputDirHandle, 'readwrite'))) return null;
+        }
+      }
+      return null;
+    }
+
+    // Single attempt at writing a file into the correct routed subfolder,
+    // creating any missing hierarchy. Aborts and removes the partial file if
+    // the write is interrupted so no `.crswap`/empty placeholder is left behind.
+    async function performOutputWrite(name, blob, category, exact = false) {
+      const targetDir = await categoryFolder(category, true);
+      if (!targetDir) return null;
+
+      // Exact writes reuse the given name (overwrite in place); otherwise the
+      // name is uniquified to avoid clobbering unrelated files.
+      const fileName = exact ? name : await uniqueOutputName(name, targetDir);
+      const fileHandle = await targetDir.getFileHandle(fileName, { create: true });
+      let writable = null;
+      try {
+        writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        writable = null;
+      } catch (err) {
+        // An interrupted or failed write leaves a Chrome `.crswap`/empty
+        // placeholder behind unless the stream and file are cleaned up, so
+        // abort any still-open stream and remove the incomplete file before
+        // rethrowing.
+        if (writable) {
+          try { await writable.abort(); } catch (_) {}
+          writable = null;
+        }
+        try { await fileHandle.remove(); } catch (_) {}
+        throw err;
+      }
       return { name: fileName, handle: fileHandle };
     }
 
-    async function uniqueOutputName(name) {
+    // Gets (or optionally creates) a subfolder inside a directory handle.
+    async function getOrCreateSubfolder(parentHandle, name, create = true) {
+      if (!parentHandle || !parentHandle.getDirectoryHandle) return null;
+      try {
+        return await parentHandle.getDirectoryHandle(name, { create });
+      } catch (err) {
+        if (create) console.error(err);
+        return null;
+      }
+    }
+
+    // Resolves the folder handle for a routing category:
+    // 'approved' -> Approved, 'trimmed' -> Approved/Trimmed, 'rejected' -> Rejected.
+    async function categoryFolder(category, create = true) {
+      if (!outputDirHandle) return null;
+      if (category === 'rejected') {
+        return getOrCreateSubfolder(outputDirHandle, 'Rejected', create);
+      }
+      const approvedDir = await getOrCreateSubfolder(outputDirHandle, 'Approved', create);
+      if (category === 'trimmed') {
+        return getOrCreateSubfolder(approvedDir, 'Trimmed', create);
+      }
+      return approvedDir;
+    }
+
+    // Removes a previously written copy from a category folder. Missing files
+    // are ignored so re-decisions and idempotent clicks converge to the latest
+    // folder without leaving strays behind.
+    async function removeFromOutputFolder(name, category) {
+      if (!outputDirHandle || !name || !category) return;
+      if (!(await ensurePermission(outputDirHandle, 'readwrite'))) return;
+      try {
+        const dir = await categoryFolder(category, false);
+        if (!dir) return;
+        const fileHandle = await dir.getFileHandle(name, { create: false });
+        await fileHandle.remove();
+      } catch (err) {
+        if (err && err.name !== 'NotFoundError') {
+          console.warn('Could not remove previous output', name, err && err.name);
+        }
+      }
+    }
+
+    async function uniqueOutputName(name, dirHandle = outputDirHandle) {
       const base = name.replace(/\.[^/.]+$/, '');
       const extMatch = name.match(/\.[^/.]+$/);
       const ext = extMatch ? extMatch[0] : '';
@@ -434,7 +547,7 @@
       // getFileHandle throws NotFoundError when the name is still free.
       while (true) {
         try {
-          await outputDirHandle.getFileHandle(candidate);
+          await dirHandle.getFileHandle(candidate);
           candidate = `${base}_${counter++}${ext}`;
         } catch (err) {
           if (err && err.name === 'NotFoundError') return candidate;
@@ -447,8 +560,25 @@
     async function resolveMediaFile(item) {
       if (item.file) return item.file;
       if (item.handle) {
-        if (!(await ensurePermission(item.handle, 'read'))) return null;
-        return await item.handle.getFile();
+        // Individual file handles inherit their grant from their containing
+        // directory, so that grant can lapse or shift during heavy batch
+        // processing and make getFile() throw a read/permission error even
+        // though the handle itself looked valid. Re-check/request permission
+        // on the authoritative parent directory before retrying, a few times.
+        const parent = item.queue === 'trimmed' ? outputDirHandle : inputDirHandle;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            if (!(await ensurePermission(item.handle, 'read'))) return null;
+            return await item.handle.getFile();
+          } catch (err) {
+            console.warn(
+              'Read failed for', item.name, `(${err && err.name})`,
+              'refreshing parent directory permission and retrying.'
+            );
+            await ensurePermission(parent, 'read');
+          }
+        }
+        return null;
       }
       return null;
     }
@@ -576,8 +706,6 @@
       if (dt.files && dt.files.length > 0) handleFiles(dt.files);
     });
 
-    fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
-
     function handleFiles(files) {
       if (!files.length) return;
       Array.from(files).forEach((file) => {
@@ -668,6 +796,45 @@
       }
     }
 
+    // Fully releases a media element's current source (pause + clear + unload)
+    // so the underlying blob URL can be revoked safely. Without this the
+    // element keeps the old buffered/decoded media in memory, which accumulates
+    // across many file switches and eventually makes later/larger files stall
+    // or fail to decode.
+    function unloadMediaPlayer(player) {
+      if (!player) return;
+      try { player.pause(); } catch (_) {}
+      try { player.removeAttribute('src'); } catch (_) {}
+      try { player.load(); } catch (_) {}
+    }
+
+    // Switches the active media to a new clip. Both players can reference the
+    // same blob URL (trim mode syncs trimVideoPlayer.src to videoPlayer.src),
+    // so both are unloaded and the previous URL revoked BEFORE a new URL is
+    // created. This guarantees only one decoded blob URL is ever alive and no
+    // element lingers on a revoked/cleared source.
+    function loadMediaIntoPlayers(media) {
+      videoPlayer.pause();
+
+      unloadMediaPlayer(videoPlayer);
+      unloadMediaPlayer(trimVideoPlayer);
+
+      if (currentObjectUrl) {
+        URL.revokeObjectURL(currentObjectUrl);
+        currentObjectUrl = null;
+      }
+
+      currentObjectUrl = URL.createObjectURL(media);
+      videoPlayer.src = currentObjectUrl;
+      videoPlayer.load();
+
+      videoPlayer.onloadedmetadata = () => {
+        trimStartSec = 0;
+        trimEndSec = videoPlayer.duration;
+        updateMainSeekbar();
+      };
+    }
+
     async function selectFile(index, queueType = 'main') {
       exitCropMode();
       exitTrimMode();
@@ -697,17 +864,7 @@
 
       // Only one decoded blob URL is alive at a time so large folders never
       // pile up in memory.
-      if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
-      currentObjectUrl = URL.createObjectURL(media);
-      trimVideoPlayer.removeAttribute('src');
-      videoPlayer.src = currentObjectUrl;
-      videoPlayer.load();
-
-      videoPlayer.onloadedmetadata = () => {
-        trimStartSec = 0;
-        trimEndSec = videoPlayer.duration;
-        updateMainSeekbar();
-      };
+      loadMediaIntoPlayers(media);
 
       updateUI();
     }
@@ -891,12 +1048,71 @@
       updateUI();
     }
 
+    // Writes the source file into the folder matching its decision exactly
+    // once. Steer by category, not by a single tracked location: the target
+    // decision folder receives the file, and stale copies are stripped from
+    // the OTHER category folders so the file never exists in more than one
+    // decision folder (even when in-memory tracking was lost, e.g. after a
+    // reload or when a stale copy pre-exists in the output root):
+    //   approve -> write 'Approved', strip stale copies from 'Rejected' + 'Approved/Trimmed'
+    //   reject  -> write 'Rejected', strip stale copies from 'Approved' + 'Approved/Trimmed'
+    // item.savedCategory/savedTo are still kept for idempotency (re-clicking an
+    // already-decided file is a no-op instead of writing a duplicate).
+    async function writeDecisionToOutput(item, category) {
+      if (!item) return false;
+      const media = await resolveMediaFile(item);
+      if (!media) return false;
+
+      const onDiskName = item.name;
+
+      // A trimmed file already lives in Approved/Trimmed — approve is a no-op.
+      // This also makes re-clicking approve on any approved item idempotent.
+      const alreadyApproved = item.savedCategory === 'approved' || item.savedCategory === 'trimmed';
+
+      // Idempotency: this exact file is already written to this exact folder
+      // with this exact name — do nothing instead of writing a duplicate.
+      if (item.savedTo === onDiskName && (item.savedCategory === category || (category === 'approved' && alreadyApproved))) {
+        return true;
+      }
+
+      // Categories (by folder structure) that may hold a stale copy of this
+      // file and must be cleaned before persisting the new decision. The
+      // target folder itself is excluded — its copy is overwritten in place by
+      // the exact write below, so it is never touched by the deletion.
+      const staleCategories = category === 'approved'
+        ? ['rejected', 'trimmed']
+        : ['approved', 'trimmed'];
+      for (const staleCategory of staleCategories) {
+        await removeFromOutputFolder(onDiskName, staleCategory);
+      }
+      item.savedCategory = null;
+      item.savedTo = null;
+
+      // Write exactly once into the designated category folder (overwrite any
+      // stale copy at that same name).
+      try {
+        const written = await writeToOutputFolder(onDiskName, media, category, true);
+        if (!written) return false;
+        item.savedTo = written.name;
+        item.savedCategory = category;
+        return true;
+      } catch (err) {
+        console.error(err);
+        alert('Could not write to the output folder: ' + (err && err.message ? err.message : err));
+        return false;
+      }
+    }
+
     function approveCurrent() {
       setCurrentStatus('approved');
+      const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
+      writeDecisionToOutput(item, 'approved');
     }
 
     function rejectCurrent() {
       setCurrentStatus('rejected');
+      const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
+      writeDecisionToOutput(item, 'rejected');
     }
 
     document.getElementById('btn-approve').onclick = approveCurrent;
@@ -1100,7 +1316,9 @@
 
       let written = null;
       try {
-        written = await writeToOutputFolder(outputName, blob);
+        // Deterministic write: repeated trim clicks overwrite the same trimmed
+        // file instead of stacking _1/_2 duplicates.
+        written = await writeToOutputFolder(outputName, blob, 'trimmed', true);
       } catch (err) {
         console.error(err);
         alert('Could not write to the output folder: ' + (err && err.message ? err.message : err));
@@ -1115,10 +1333,23 @@
         sourceName: sourceItem ? sourceItem.name : null,
         status: 'approved',
         savedTo: savedTo,
+        savedCategory: 'trimmed',
         queue: 'trimmed'
       };
-      trimmedFilesState.push(processedItem);
-      recordTrimmedOutput(processedItem);
+
+      // Replace any existing trimmed entry for this output rather than pushing
+      // a duplicate so a second trim updates the same queue item in place.
+      const existing = trimmedFilesState.find(t => t.name === processedItem.name);
+      if (existing) {
+        existing.file = processedItem.file;
+        existing.handle = processedItem.handle;
+        existing.savedTo = processedItem.savedTo;
+        existing.status = processedItem.status;
+        recordTrimmedOutput(existing);
+      } else {
+        trimmedFilesState.push(processedItem);
+        recordTrimmedOutput(processedItem);
+      }
 
       if (sourceItem && anchorQueue === 'main') {
         // The pre-trimmed input is superseded by the new output file.
@@ -1135,6 +1366,50 @@
 
       if (!savedTo) {
         alert('No output folder selected — the processed file is only in the Trimmed queue. Choose an output folder to write results to disk.');
+      }
+    }
+
+    // Crop saves in place: write the cropped clip into the Approved output
+    // folder, mark the source approved, and leave the active selection
+    // untouched so the reviewer stays on the current clip. Unlike trimming,
+    // this does not run the rejection cascade or re-route the selection.
+    async function finalizeCropOutput(sourceItem, blob, outputName) {
+      let written = null;
+      try {
+        // Cropping approves the source in place, so strip any stale copy of
+        // the source from the non-approved folders (Rejected + Approved/Trimmed)
+        // before writing, keeping the file in only the latest designated folder.
+        if (sourceItem && sourceItem.name) {
+          await removeFromOutputFolder(sourceItem.name, 'rejected');
+          await removeFromOutputFolder(sourceItem.name, 'trimmed');
+        }
+        // Deterministic write: repeated crop clicks overwrite the same cropped
+        // file instead of stacking duplicates.
+        written = await writeToOutputFolder(outputName, blob, 'approved', true);
+      } catch (err) {
+        console.error(err);
+        alert('Could not write to the output folder: ' + (err && err.message ? err.message : err));
+      }
+      const savedTo = written ? written.name : null;
+
+      exitTrimMode();
+      exitCropMode();
+
+      if (sourceItem) {
+        sourceItem.status = 'approved';
+        sourceItem.processed = true;
+        if (written) {
+          sourceItem.savedTo = written.name;
+          sourceItem.savedCategory = 'approved';
+        }
+        if (sourceItem.queue === 'main') recordFileProgress(sourceItem);
+        else recordTrimmedOutput(sourceItem);
+      }
+
+      updateUI();
+
+      if (!savedTo) {
+        alert('No output folder selected — the cropped file could not be saved to disk.');
       }
     }
 
@@ -1368,9 +1643,9 @@
 
         const target = currentQueueType === 'main' ? filesState : trimmedFilesState;
         const sourceItem = target[currentIndex];
-        const baseName = sourceItem.name.replace(/\.[^.]+$/, '');
+        const baseName = sourceItem.name.replace(/\.[^/.]+$/, '');
 
-        await finalizeProcessedOutput(sourceItem, croppedBlob, `${baseName}_cropped.${ext}`);
+        await finalizeCropOutput(sourceItem, croppedBlob, `${baseName}_cropped.${ext}`);
 
         btnApplyCrop.textContent = "Apply Crop (Save to Output)";
         btnApplyCrop.disabled = false;
@@ -1381,28 +1656,6 @@
         btnApplyCrop.disabled = false;
         alert("Failed to render video crop: " + (err && err.message ? err.message : err));
       }
-    };
-
-    // Export Handler — writes to the output folder when one is connected,
-    // otherwise falls back to a normal browser download.
-    document.getElementById('btn-save-current').onclick = async () => {
-      if (currentIndex === -1) return;
-      const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
-      if (!item) return;
-
-      const media = await resolveMediaFile(item);
-      if (!media) return;
-      const name = `${item.status === 'rejected' ? 'REJECTED_' : 'APPROVED_'}${item.name}`;
-
-      if (outputDirHandle) {
-        try {
-          const savedTo = await writeToOutputFolder(name, media);
-          if (savedTo) return;
-        } catch (err) {
-          console.error(err);
-        }
-      }
-      saveAs(media, name);
     };
 
     // Boot: restore saved progress and offer to reconnect the last folders.
