@@ -4,6 +4,13 @@
     let currentIndex = -1;
     let currentQueueType = 'main';
 
+    // Local Folder State (File System Access API)
+    let inputDirHandle = null;
+    let outputDirHandle = null;
+    let currentObjectUrl = null;
+
+    const MEDIA_EXTENSIONS = /\.(mp4|m4v|mov|webm|mkv|avi|mpg|mpeg|ogv|mp3|wav|m4a|aac|ogg|oga|flac)$/i;
+
     // Zoom & Pan State
     let zoomLevel = 1;
     let panX = 0;
@@ -31,9 +38,18 @@
 
     // DOM Elements
     const fileInput = document.getElementById('file-input');
-    const folderInput = document.getElementById('folder-input');
     const fileListEl = document.getElementById('file-list');
     const trimmedFileListEl = document.getElementById('trimmed-file-list');
+    const queueCountEl = document.getElementById('queue-count');
+
+    // Local Folder / Session DOM
+    const btnChooseInput = document.getElementById('btn-choose-input');
+    const btnChooseOutput = document.getElementById('btn-choose-output');
+    const btnResumeSession = document.getElementById('btn-resume-session');
+    const btnClearSession = document.getElementById('btn-clear-session');
+    const inputFolderLabel = document.getElementById('input-folder-label');
+    const outputFolderLabel = document.getElementById('output-folder-label');
+    const sessionStatusEl = document.getElementById('session-status');
     
     // Video Players
     const videoPlayer = document.getElementById('video-player');
@@ -86,6 +102,332 @@
 
     // Crop Box DOM
     const cropBox = document.getElementById('crop-box');
+
+    // ---------------------------------------------------------------
+    // Session Persistence (localStorage) — remembers per-file progress
+    // so a closed browser can resume exactly where the review stopped.
+    // ---------------------------------------------------------------
+    const SESSION_KEY = 'genz-media-qa.session.v1';
+
+    let session = {
+      inputFolderName: null,
+      outputFolderName: null,
+      files: {},      // "<input folder>/<file name>" -> { status, processed }
+      trimmed: [],    // [{ name, sourceName, status }]
+      updatedAt: null
+    };
+
+    function loadSession() {
+      try {
+        const raw = localStorage.getItem(SESSION_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          session = {
+            inputFolderName: parsed.inputFolderName || null,
+            outputFolderName: parsed.outputFolderName || null,
+            files: parsed.files && typeof parsed.files === 'object' ? parsed.files : {},
+            trimmed: Array.isArray(parsed.trimmed) ? parsed.trimmed : [],
+            updatedAt: parsed.updatedAt || null
+          };
+        }
+      } catch (err) {
+        console.warn('Could not read saved session', err);
+      }
+    }
+
+    function saveSession() {
+      session.updatedAt = new Date().toISOString();
+      try {
+        localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      } catch (err) {
+        console.warn('Could not persist session', err);
+      }
+      renderSessionStatus();
+    }
+
+    function sessionKeyFor(name) {
+      return `${session.inputFolderName || 'local'}/${name}`;
+    }
+
+    function recordFileProgress(item) {
+      if (!item || item.queue !== 'main') return;
+      session.files[sessionKeyFor(item.name)] = {
+        status: item.status,
+        processed: !!item.processed
+      };
+      saveSession();
+    }
+
+    function recordTrimmedOutput(item) {
+      const existing = session.trimmed.find(t => t.name === item.name);
+      if (existing) {
+        existing.status = item.status;
+        existing.sourceName = item.sourceName || existing.sourceName || null;
+      } else {
+        session.trimmed.push({
+          name: item.name,
+          sourceName: item.sourceName || null,
+          status: item.status
+        });
+      }
+      saveSession();
+    }
+
+    function applySessionProgress(item) {
+      const saved = session.files[sessionKeyFor(item.name)];
+      if (!saved) return item;
+      item.status = saved.status || item.status;
+      item.processed = !!saved.processed;
+      return item;
+    }
+
+    function clearSession() {
+      session = {
+        inputFolderName: session.inputFolderName,
+        outputFolderName: session.outputFolderName,
+        files: {},
+        trimmed: [],
+        updatedAt: null
+      };
+      filesState.forEach(item => {
+        item.status = 'pending';
+        item.processed = false;
+      });
+      try {
+        localStorage.removeItem(SESSION_KEY);
+      } catch (err) {
+        console.warn('Could not clear session', err);
+      }
+      saveSession();
+      updateUI();
+    }
+
+    function renderSessionStatus() {
+      const reviewed = Object.values(session.files).filter(f => f.status && f.status !== 'pending').length;
+      if (!reviewed && !session.trimmed.length) {
+        sessionStatusEl.textContent = 'No saved progress';
+      } else {
+        sessionStatusEl.textContent = `Session: ${reviewed} reviewed · ${session.trimmed.length} processed`;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Directory handle persistence (IndexedDB) so "Resume Last Folders"
+    // can re-open the same input/output directories after a restart.
+    // ---------------------------------------------------------------
+    const HANDLE_DB = 'genz-media-qa-handles';
+    const HANDLE_STORE = 'handles';
+
+    function openHandleDb() {
+      return new Promise((resolve, reject) => {
+        if (!window.indexedDB) return resolve(null);
+        const req = indexedDB.open(HANDLE_DB, 1);
+        req.onupgradeneeded = () => {
+          req.result.createObjectStore(HANDLE_STORE);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function storeHandle(key, handle) {
+      try {
+        const db = await openHandleDb();
+        if (!db) return;
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(HANDLE_STORE, 'readwrite');
+          tx.objectStore(HANDLE_STORE).put(handle, key);
+          tx.oncomplete = resolve;
+          tx.onerror = () => reject(tx.error);
+        });
+      } catch (err) {
+        console.warn('Could not store directory handle', err);
+      }
+    }
+
+    async function readHandle(key) {
+      try {
+        const db = await openHandleDb();
+        if (!db) return null;
+        return await new Promise((resolve, reject) => {
+          const tx = db.transaction(HANDLE_STORE, 'readonly');
+          const req = tx.objectStore(HANDLE_STORE).get(key);
+          req.onsuccess = () => resolve(req.result || null);
+          req.onerror = () => reject(req.error);
+        });
+      } catch (err) {
+        console.warn('Could not read directory handle', err);
+        return null;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Two-Folder Local Workflow
+    // ---------------------------------------------------------------
+    function supportsFileSystemAccess() {
+      return typeof window.showDirectoryPicker === 'function';
+    }
+
+    async function ensurePermission(handle, mode) {
+      if (!handle || !handle.queryPermission) return true;
+      const opts = { mode };
+      if ((await handle.queryPermission(opts)) === 'granted') return true;
+      return (await handle.requestPermission(opts)) === 'granted';
+    }
+
+    function renderFolderLabels() {
+      inputFolderLabel.textContent = inputDirHandle
+        ? inputDirHandle.name
+        : (session.inputFolderName ? `${session.inputFolderName} (not connected)` : 'Not selected');
+      outputFolderLabel.textContent = outputDirHandle
+        ? outputDirHandle.name
+        : (session.outputFolderName ? `${session.outputFolderName} (not connected)` : 'Not selected');
+    }
+
+    async function loadFilesFromInputDirectory() {
+      if (!inputDirHandle) return;
+
+      // Only the handles are kept in memory — file bytes are read on demand
+      // when a clip is selected, so huge folders never hit the ~2GB cap.
+      const items = [];
+      for await (const entry of inputDirHandle.values()) {
+        if (entry.kind !== 'file') continue;
+        if (!MEDIA_EXTENSIONS.test(entry.name)) continue;
+        items.push(applySessionProgress({
+          handle: entry,
+          file: null,
+          name: entry.name,
+          status: 'pending',
+          processed: false,
+          queue: 'main'
+        }));
+      }
+
+      items.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+      filesState = items;
+      currentIndex = -1;
+      currentQueueType = 'main';
+      updateUI();
+
+      const firstPending = filesState.findIndex(f => f.status === 'pending');
+      if (filesState.length) selectFile(firstPending === -1 ? 0 : firstPending, 'main');
+    }
+
+    async function chooseInputFolder() {
+      if (!supportsFileSystemAccess()) {
+        alert('This browser does not support local folder access. Use Chrome or Edge (desktop), or the "Upload Files" button.');
+        return;
+      }
+      try {
+        const handle = await window.showDirectoryPicker({ id: 'media-qa-input', mode: 'read' });
+        if (!(await ensurePermission(handle, 'read'))) return;
+        inputDirHandle = handle;
+        if (session.inputFolderName !== handle.name) {
+          // Different folder: progress is tracked per folder, so start clean.
+          session.files = {};
+        }
+        session.inputFolderName = handle.name;
+        saveSession();
+        await storeHandle('input', handle);
+        renderFolderLabels();
+        await loadFilesFromInputDirectory();
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        console.error(err);
+        alert('Could not open the input folder: ' + (err && err.message ? err.message : err));
+      }
+    }
+
+    async function chooseOutputFolder() {
+      if (!supportsFileSystemAccess()) {
+        alert('This browser does not support local folder access. Use Chrome or Edge (desktop).');
+        return;
+      }
+      try {
+        const handle = await window.showDirectoryPicker({ id: 'media-qa-output', mode: 'readwrite' });
+        if (!(await ensurePermission(handle, 'readwrite'))) return;
+        outputDirHandle = handle;
+        session.outputFolderName = handle.name;
+        saveSession();
+        await storeHandle('output', handle);
+        renderFolderLabels();
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        console.error(err);
+        alert('Could not open the output folder: ' + (err && err.message ? err.message : err));
+      }
+    }
+
+    async function resumeSavedFolders() {
+      const savedInput = await readHandle('input');
+      const savedOutput = await readHandle('output');
+
+      if (savedInput && await ensurePermission(savedInput, 'read')) {
+        inputDirHandle = savedInput;
+        session.inputFolderName = savedInput.name;
+      }
+      if (savedOutput && await ensurePermission(savedOutput, 'readwrite')) {
+        outputDirHandle = savedOutput;
+        session.outputFolderName = savedOutput.name;
+      }
+      saveSession();
+      renderFolderLabels();
+      if (inputDirHandle) await loadFilesFromInputDirectory();
+      if (!inputDirHandle && !outputDirHandle) {
+        alert('Could not reconnect to the saved folders. Please choose them again.');
+      }
+    }
+
+    // Writes a processed/trimmed file straight into the output folder.
+    // Returns the written file name, or null when no output folder is set.
+    async function writeToOutputFolder(name, blob) {
+      if (!outputDirHandle) return null;
+      if (!(await ensurePermission(outputDirHandle, 'readwrite'))) return null;
+
+      const fileName = await uniqueOutputName(name);
+      const fileHandle = await outputDirHandle.getFileHandle(fileName, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return fileName;
+    }
+
+    async function uniqueOutputName(name) {
+      const base = name.replace(/\.[^/.]+$/, '');
+      const extMatch = name.match(/\.[^/.]+$/);
+      const ext = extMatch ? extMatch[0] : '';
+      let candidate = name;
+      let counter = 1;
+      // getFileHandle throws NotFoundError when the name is still free.
+      while (true) {
+        try {
+          await outputDirHandle.getFileHandle(candidate);
+          candidate = `${base}_${counter++}${ext}`;
+        } catch (err) {
+          if (err && err.name === 'NotFoundError') return candidate;
+          return candidate;
+        }
+      }
+    }
+
+    // Resolves the bytes for a queue item, reading from disk on demand.
+    async function resolveMediaFile(item) {
+      if (item.file) return item.file;
+      if (item.handle) {
+        if (!(await ensurePermission(item.handle, 'read'))) return null;
+        return await item.handle.getFile();
+      }
+      return null;
+    }
+
+    btnChooseInput.onclick = chooseInputFolder;
+    btnChooseOutput.onclick = chooseOutputFolder;
+    btnResumeSession.onclick = resumeSavedFolders;
+    btnClearSession.onclick = () => {
+      if (confirm('Clear saved review progress for this folder? Files on disk are untouched.')) clearSession();
+    };
 
     function pickRecorderMime() {
       const candidates = [
@@ -204,17 +546,19 @@
     });
 
     fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
-    folderInput.addEventListener('change', (e) => handleFiles(e.target.files));
 
     function handleFiles(files) {
       if (!files.length) return;
       Array.from(files).forEach((file) => {
-        if (file.type.startsWith('video/') || file.type.startsWith('audio/')) {
-          filesState.push({
+        if (file.type.startsWith('video/') || file.type.startsWith('audio/') || MEDIA_EXTENSIONS.test(file.name)) {
+          filesState.push(applySessionProgress({
             file: file,
+            handle: null,
             name: file.name,
-            status: 'pending'
-          });
+            status: 'pending',
+            processed: false,
+            queue: 'main'
+          }));
         }
       });
       updateUI();
@@ -232,6 +576,7 @@
       statPassed.textContent = passed;
       statRejected.textContent = rejected;
       statTrimmed.textContent = trimmedFilesState.length;
+      if (queueCountEl) queueCountEl.textContent = `(${total})`;
 
       // Primary Queue List
       fileListEl.innerHTML = '';
@@ -246,8 +591,9 @@
           let statusIcon = '<span class="text-slate-500">⚪</span>';
           if (item.status === 'approved') statusIcon = '<span class="text-emerald-400 font-bold">✓</span>';
           if (item.status === 'rejected') statusIcon = '<span class="text-rose-400 font-bold">✕</span>';
+          if (item.processed) statusIcon = `<span class="text-sky-400" title="Processed to output folder">✂️</span>${statusIcon}`;
 
-          li.innerHTML = `<span class="truncate max-w-[170px] text-xs">${index + 1}. ${item.name}</span>${statusIcon}`;
+          li.innerHTML = `<span class="truncate max-w-[170px] text-xs">${index + 1}. ${item.name}</span><span class="flex items-center gap-1 shrink-0">${statusIcon}</span>`;
           li.onclick = () => selectFile(index, 'main');
           fileListEl.appendChild(li);
         });
@@ -266,7 +612,10 @@
           let statusIcon = '<span class="text-emerald-400 font-bold">✓</span>';
           if (item.status === 'rejected') statusIcon = '<span class="text-rose-400 font-bold">✕</span>';
 
-          li.innerHTML = `<span class="truncate max-w-[170px] text-xs">✂️ ${item.name}</span>${statusIcon}`;
+          const savedBadge = item.savedTo
+            ? '<span class="text-emerald-400" title="Written to output folder">💾</span>'
+            : '';
+          li.innerHTML = `<span class="truncate max-w-[170px] text-xs">✂️ ${item.name}</span><span class="flex items-center gap-1 shrink-0">${savedBadge}${statusIcon}</span>`;
           li.onclick = () => selectFile(index, 'trimmed');
           trimmedFileListEl.appendChild(li);
         });
@@ -288,7 +637,7 @@
       }
     }
 
-    function selectFile(index, queueType = 'main') {
+    async function selectFile(index, queueType = 'main') {
       exitCropMode();
       exitTrimMode();
       setZoom(1);
@@ -299,12 +648,28 @@
       const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
       if (!item) return;
 
+      updateUI();
+
+      const media = await resolveMediaFile(item);
+      if (!media) {
+        alert(`Could not read "${item.name}" from the input folder.`);
+        return;
+      }
+
+      // Selection may have moved on while the file was being read from disk.
+      const stillCurrent = currentQueueType === queueType && currentIndex === index;
+      if (!stillCurrent) return;
+
       emptyState.classList.add('hidden');
       trimVideoPlayer.classList.add('hidden');
       videoPlayer.classList.remove('hidden');
-      
-      const mediaUrl = URL.createObjectURL(item.file);
-      videoPlayer.src = mediaUrl;
+
+      // Only one decoded blob URL is alive at a time so large folders never
+      // pile up in memory.
+      if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = URL.createObjectURL(media);
+      trimVideoPlayer.removeAttribute('src');
+      videoPlayer.src = currentObjectUrl;
       videoPlayer.load();
 
       videoPlayer.onloadedmetadata = () => {
@@ -485,18 +850,22 @@
     }
 
     // QA Decisions
-    function approveCurrent() {
+    function setCurrentStatus(status) {
       if (currentIndex === -1) return;
       const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
-      if (item) item.status = 'approved';
+      if (!item) return;
+      item.status = status;
+      if (currentQueueType === 'main') recordFileProgress(item);
+      else recordTrimmedOutput(item);
       updateUI();
     }
 
+    function approveCurrent() {
+      setCurrentStatus('approved');
+    }
+
     function rejectCurrent() {
-      if (currentIndex === -1) return;
-      const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
-      if (item) item.status = 'rejected';
-      updateUI();
+      setCurrentStatus('rejected');
     }
 
     document.getElementById('btn-approve').onclick = approveCurrent;
@@ -670,15 +1039,7 @@
         if (!blob.size) throw new Error("Empty recording");
 
         const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
-        const trimmedCopyItem = {
-          file: blob,
-          name: `${curItem.name.replace(/\.[^/.]+$/, "")}_trimmed.${ext}`,
-          status: 'approved'
-        };
-
-        trimmedFilesState.push(trimmedCopyItem);
-        updateUI();
-        selectFile(trimmedFilesState.length - 1, 'trimmed');
+        await finalizeProcessedOutput(curItem, blob, `${curItem.name.replace(/\.[^/.]+$/, "")}_trimmed.${ext}`);
 
         trimVideoPlayer.playbackRate = prevRate;
         isRendering = false;
@@ -690,18 +1051,59 @@
         trimVideoPlayer.playbackRate = prevRate;
         isRendering = false;
         alert("Frame-accurate render is not supported by this browser, saving the original as a copy instead.");
-        const trimmedCopyItem = {
-          file: curItem.file,
-          name: `${curItem.name.replace(/\.[^/.]+$/, "")}_trimmed.webm`,
-          status: 'approved'
-        };
-        trimmedFilesState.push(trimmedCopyItem);
-        updateUI();
-        selectFile(trimmedFilesState.length - 1, 'trimmed');
+        const original = await resolveMediaFile(curItem);
+        if (original) {
+          await finalizeProcessedOutput(curItem, original, `${curItem.name.replace(/\.[^/.]+$/, "")}_trimmed.webm`);
+        }
         btnTrimCopy.textContent = "Save as copy";
         btnTrimCopy.disabled = false;
       }
     };
+
+    // Shared post-processing step for trim/crop results: write the new file to
+    // the output folder, reject the pre-processed original, and keep the
+    // selection anchored on that original so the audit trail stays readable.
+    async function finalizeProcessedOutput(sourceItem, blob, outputName) {
+      const anchorIndex = currentIndex;
+      const anchorQueue = currentQueueType;
+
+      let savedTo = null;
+      try {
+        savedTo = await writeToOutputFolder(outputName, blob);
+      } catch (err) {
+        console.error(err);
+        alert('Could not write to the output folder: ' + (err && err.message ? err.message : err));
+      }
+
+      const processedItem = {
+        file: blob,
+        handle: null,
+        name: savedTo || outputName,
+        sourceName: sourceItem ? sourceItem.name : null,
+        status: 'approved',
+        savedTo: savedTo,
+        queue: 'trimmed'
+      };
+      trimmedFilesState.push(processedItem);
+      recordTrimmedOutput(processedItem);
+
+      if (sourceItem && anchorQueue === 'main') {
+        // The pre-trimmed input is superseded by the new output file.
+        sourceItem.status = 'rejected';
+        sourceItem.processed = true;
+        recordFileProgress(sourceItem);
+      }
+
+      exitTrimMode();
+      exitCropMode();
+      currentIndex = anchorIndex;
+      currentQueueType = anchorQueue;
+      updateUI();
+
+      if (!savedTo) {
+        alert('No output folder selected — the processed file is only in the Trimmed queue. Choose an output folder to write results to disk.');
+      }
+    }
 
     // Crop Tool Engine
     function enableCropMode() {
@@ -932,63 +1334,61 @@
         if (croppedBlob.size === 0) throw new Error("Crop produced an empty file");
 
         const target = currentQueueType === 'main' ? filesState : trimmedFilesState;
-        const baseName = target[currentIndex].name.replace(/\.[^.]+$/, '');
-        target[currentIndex] = {
-          file: croppedBlob,
-          name: `${baseName}_cropped.${ext}`,
-          status: 'approved'
-        };
+        const sourceItem = target[currentIndex];
+        const baseName = sourceItem.name.replace(/\.[^.]+$/, '');
 
-        exitCropMode();
-        updateUI();
-        selectFile(currentIndex, currentQueueType);
+        await finalizeProcessedOutput(sourceItem, croppedBlob, `${baseName}_cropped.${ext}`);
 
-        btnApplyCrop.textContent = "Apply Crop (Replace Original)";
+        btnApplyCrop.textContent = "Apply Crop (Save to Output)";
         btnApplyCrop.disabled = false;
 
       } catch (err) {
         console.error(err);
-        btnApplyCrop.textContent = "Apply Crop (Replace Original)";
+        btnApplyCrop.textContent = "Apply Crop (Save to Output)";
         btnApplyCrop.disabled = false;
         alert("Failed to render video crop: " + (err && err.message ? err.message : err));
       }
     };
 
-    // Export Handlers
-    document.getElementById('btn-save-current').onclick = () => {
+    // Export Handler — writes to the output folder when one is connected,
+    // otherwise falls back to a normal browser download.
+    document.getElementById('btn-save-current').onclick = async () => {
       if (currentIndex === -1) return;
       const item = currentQueueType === 'main' ? filesState[currentIndex] : trimmedFilesState[currentIndex];
-      saveAs(item.file, `${item.status === 'rejected' ? 'REJECTED_' : 'APPROVED_'}${item.name}`);
+      if (!item) return;
+
+      const media = await resolveMediaFile(item);
+      if (!media) return;
+      const name = `${item.status === 'rejected' ? 'REJECTED_' : 'APPROVED_'}${item.name}`;
+
+      if (outputDirHandle) {
+        try {
+          const savedTo = await writeToOutputFolder(name, media);
+          if (savedTo) return;
+        } catch (err) {
+          console.error(err);
+        }
+      }
+      saveAs(media, name);
     };
 
-    document.getElementById('btn-save-zip').onclick = async () => {
-      const zip = new JSZip();
-      const approvedFolder = zip.folder("Approved");
-      const rejectedFolder = zip.folder("Rejected");
-      const trimmedFolder = zip.folder("Trimmed");
+    // Boot: restore saved progress and offer to reconnect the last folders.
+    (async () => {
+      loadSession();
+      renderSessionStatus();
+      renderFolderLabels();
 
-      let count = 0;
-
-      filesState.forEach(item => {
-        if (item.status === 'approved') {
-          approvedFolder.file(item.name, item.file);
-          count++;
-        } else if (item.status === 'rejected') {
-          rejectedFolder.file(item.name, item.file);
-          count++;
-        }
-      });
-
-      trimmedFilesState.forEach(item => {
-        trimmedFolder.file(item.name, item.file);
-        count++;
-      });
-
-      if (count === 0) {
-        alert('Please approve, reject, or trim at least one file before exporting.');
+      if (!supportsFileSystemAccess()) {
+        btnChooseInput.disabled = true;
+        btnChooseOutput.disabled = true;
+        btnChooseInput.title = 'Local folder access requires Chrome or Edge on desktop';
+        btnChooseOutput.title = btnChooseInput.title;
+        btnChooseInput.classList.add('opacity-50', 'cursor-not-allowed');
+        btnChooseOutput.classList.add('opacity-50', 'cursor-not-allowed');
         return;
       }
 
-      const zipBlob = await zip.generateAsync({ type: "blob" });
-      saveAs(zipBlob, `QA_Media_Batch_${Date.now()}.zip`);
-    };
+      const savedInput = await readHandle('input');
+      const savedOutput = await readHandle('output');
+      if (savedInput || savedOutput) btnResumeSession.classList.remove('hidden');
+    })();

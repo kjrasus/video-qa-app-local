@@ -11,13 +11,12 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Review, approve, reject, trim and crop audio/video files for quality assurance. Export approved and trimmed media as a ZIP.",
+          "Review, approve, reject, trim and crop audio/video files for quality assurance. Read from a local input folder and write processed media straight to a local output folder.",
       },
       { property: "og:title", content: "Gen Z Studio" },
       {
         property: "og:description",
-        content:
-          "Review, approve, reject, trim and crop audio/video files for quality assurance.",
+        content: "Review, approve, reject, trim and crop audio/video files for quality assurance.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -28,7 +27,6 @@ export const Route = createFileRoute("/")({
 
 const EXTERNAL_SCRIPTS = [
   "https://cdn.tailwindcss.com",
-  "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js",
   "https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js",
 ];
 

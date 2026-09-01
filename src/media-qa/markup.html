@@ -52,21 +52,44 @@
           <span>📁 Upload Files</span>
           <input type="file" id="file-input" multiple accept="video/*,audio/*" class="hidden" />
         </label>
-        <label class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition shadow-sm">
-          <span>📂 Upload Folder</span>
-          <input type="file" id="folder-input" webkitdirectory directory multiple class="hidden" />
-        </label>
-        
+        <button id="btn-choose-input" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm">
+          📥 Choose Input Folder
+        </button>
+        <button id="btn-choose-output" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm">
+          📤 Choose Output Folder
+        </button>
+
         <div class="h-5 w-px bg-slate-800 mx-1"></div>
 
         <button id="btn-save-current" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-3 py-1.5 rounded-lg text-xs font-medium transition shadow-sm">
           💾 Save Current
         </button>
-        <button id="btn-save-zip" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm flex items-center gap-1.5">
-          <span>📦 Export ZIP</span>
-        </button>
       </div>
 
+    </div>
+
+    <!-- Local Folder / Session Status Bar -->
+    <div class="flex items-center justify-between gap-3 text-[11px] text-slate-400 bg-slate-950 border border-slate-800/80 rounded-lg px-3 py-1.5">
+      <div class="flex items-center gap-4 min-w-0">
+        <span class="flex items-center gap-1.5 truncate">
+          <span class="text-indigo-400 font-bold uppercase tracking-wider">Input:</span>
+          <span id="input-folder-label" class="font-mono text-slate-300 truncate">Not selected</span>
+        </span>
+        <span class="text-slate-700">|</span>
+        <span class="flex items-center gap-1.5 truncate">
+          <span class="text-emerald-400 font-bold uppercase tracking-wider">Output:</span>
+          <span id="output-folder-label" class="font-mono text-slate-300 truncate">Not selected</span>
+        </span>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <span id="session-status" class="font-mono text-slate-500">No saved session</span>
+        <button id="btn-resume-session" class="hidden bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-2 py-1 rounded text-[11px] font-semibold">
+          ↻ Resume Last Folders
+        </button>
+        <button id="btn-clear-session" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-400 px-2 py-1 rounded text-[11px] font-medium">
+          Clear Session
+        </button>
+      </div>
     </div>
   </header>
 
@@ -159,19 +182,22 @@
       </div>
 
       <!-- Primary Media Queue -->
-      <div class="flex-1 flex flex-col min-h-[120px] bg-slate-950 p-3 rounded-xl border border-slate-800">
-        <div class="text-[11px] font-bold uppercase tracking-wider text-indigo-400 mb-2 text-center">Media Queue</div>
-        <ul id="file-list" class="flex-1 overflow-y-auto space-y-1 text-xs pr-1 border border-slate-800 rounded-lg p-1.5 bg-slate-900/60">
+      <div class="queue-panel flex flex-col bg-slate-950 p-3 rounded-xl border border-slate-800">
+        <div class="text-[11px] font-bold uppercase tracking-wider text-indigo-400 mb-2 text-center flex items-center justify-center gap-1.5">
+          <span>Media Queue</span>
+          <span id="queue-count" class="font-mono text-slate-500 normal-case tracking-normal">(0)</span>
+        </div>
+        <ul id="file-list" class="queue-list flex-1 overflow-y-auto space-y-1 text-xs pr-1 border border-slate-800 rounded-lg p-1.5 bg-slate-900/60">
           <li class="text-slate-500 p-3 text-center italic">No media loaded yet</li>
         </ul>
       </div>
 
       <!-- Dedicated Trimmed Files Queue -->
-      <div class="h-36 flex flex-col bg-slate-950 p-3 rounded-xl border border-slate-800">
+      <div class="queue-panel-secondary flex flex-col bg-slate-950 p-3 rounded-xl border border-slate-800">
         <div class="text-[11px] font-bold uppercase tracking-wider text-sky-400 mb-2 text-center flex items-center justify-center gap-1">
           <span>✂️ Trimmed Files Queue</span>
         </div>
-        <ul id="trimmed-file-list" class="flex-1 overflow-y-auto space-y-1 text-xs pr-1 border border-slate-800 rounded-lg p-1.5 bg-slate-900/60">
+        <ul id="trimmed-file-list" class="queue-list-secondary flex-1 overflow-y-auto space-y-1 text-xs pr-1 border border-slate-800 rounded-lg p-1.5 bg-slate-900/60">
           <li class="text-slate-500 p-2 text-center italic">No trimmed files saved yet</li>
         </ul>
       </div>
@@ -245,7 +271,7 @@
 
           <div class="flex items-center gap-2">
             <button id="crop-reset" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs px-2.5 py-1 rounded font-medium">Reset Box</button>
-            <button id="btn-apply-crop" class="bg-amber-500 hover:bg-amber-400 text-slate-950 px-3 py-1 rounded text-xs font-bold shadow">Apply Crop (Replace Original)</button>
+            <button id="btn-apply-crop" class="bg-amber-500 hover:bg-amber-400 text-slate-950 px-3 py-1 rounded text-xs font-bold shadow">Apply Crop (Save to Output)</button>
             <button id="btn-exit-crop" class="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-2.5 py-1 rounded-lg text-xs">Close</button>
           </div>
         </div>

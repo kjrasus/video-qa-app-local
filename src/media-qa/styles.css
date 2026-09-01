@@ -89,6 +89,34 @@
     .handle-bl { bottom: -7px; left: -7px; cursor: nesw-resize; }
     .handle-br { bottom: -7px; right: -7px; cursor: nwse-resize; }
 
+    /* Media Queue Panels — tall vertical lists */
+    .queue-panel {
+      flex: 1 1 auto;
+      min-height: 55vh;
+    }
+    .queue-list {
+      min-height: 48vh;
+      max-height: none;
+      scrollbar-width: thin;
+    }
+    .queue-panel-secondary {
+      flex: 0 0 auto;
+      min-height: 22vh;
+    }
+    .queue-list-secondary {
+      min-height: 15vh;
+      scrollbar-width: thin;
+    }
+    .queue-list::-webkit-scrollbar,
+    .queue-list-secondary::-webkit-scrollbar {
+      width: 8px;
+    }
+    .queue-list::-webkit-scrollbar-thumb,
+    .queue-list-secondary::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+
     /* Pan/Zoom Styling */
     .zoom-container {
       transition: transform 0.05s ease-out;
